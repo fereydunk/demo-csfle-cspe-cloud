@@ -1210,30 +1210,10 @@ def build_consumer_page(topic_key: str, role: str, title: str, accent: str) -> s
     nav_key = f"{topic_key}-{'auth' if role == 'authorized' else 'noauth'}"
     opaque_class = "true" if (topic_key == "cspe" and role == "unauthorized") else "false"
     slug = "with-kek" if role == "authorized" else "no-kek"
-    # CSPE no-KEK shows the raw encrypted bytes wrapped in {"__raw__": "<b64>"} —
-    # matching how Confluent Cloud's UI displays un-decryptable CSPE payloads.
-    # Each record is opaque ciphertext (the demo's CSPE point: zero visibility
-    # without KEK access, vs CSFLE no-KEK where record structure is preserved
-    # and only the PII fields are ciphertext).
-    cspe_nokek_note = (
-        '<div class="banner warn">CSPE encrypts the <em>entire payload</em>. '
-        'Without KEK access the JSON deserializer can\'t reconstruct the record, '
-        'so this page consumes the topic via the plain Kafka client (not the '
-        "JSON-schema console consumer) and shows the raw encrypted bytes wrapped in "
-        "<span class=\"kbd\">{&quot;__raw__&quot;: &quot;&lt;base64&gt;&quot;}</span> "
-        '— matching how Confluent Cloud\'s console UI displays un-decryptable CSPE '
-        'payloads. Compare this opaque blob to <a href="/cspe/with-kek" '
-        'style="color:#79c0ff">/cspe/with-kek</a> (full plaintext) or '
-        '<a href="/csfle/no-kek" style="color:#79c0ff">/csfle/no-kek</a> '
-        '(record structure visible, only PII fields ciphertext). That contrast is '
-        'the demo\'s point.</div>'
-        if topic_key == "cspe" and role == "unauthorized" else ""
-    )
     body = f"""
 <header class="accent"><h1>{html.escape(title)}</h1>
   <div class="sub">topic <span class="kbd">{html.escape(topic)}</span></div>
 </header>
-{cspe_nokek_note}
 
 <div class="card">
   <div class="card-title">Consumer configuration</div>
