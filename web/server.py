@@ -1151,9 +1151,8 @@ def _render_consumer_config(env: dict[str, str], topic_key: str, role: str) -> s
         ("rule.executors._default_.class", EXECUTOR),
     ]
 
-    # AWS env — what the subprocess sees. _consumer_env() decides this based
-    # on role: authorized injects creds; unauthorized strips them and points
-    # the SDK at /dev/null + disables IMDS.
+    # AWS env — only relevant when KEK access is granted (no-KEK consumers
+    # don't interact with KMS at all, so the AWS env state is noise).
     if role == "authorized":
         aws = _aws_creds()
         aws_state = [
@@ -1163,14 +1162,7 @@ def _render_consumer_config(env: dict[str, str], topic_key: str, role: str) -> s
             ("AWS_REGION",            aws.get("AWS_REGION", "")),
         ]
     else:
-        aws_state = [
-            ("AWS_ACCESS_KEY_ID",           "(stripped — demo's no-KEK mode)"),
-            ("AWS_SECRET_ACCESS_KEY",       "(stripped)"),
-            ("AWS_SESSION_TOKEN",           "(stripped)"),
-            ("AWS_SHARED_CREDENTIALS_FILE", "/dev/null"),
-            ("AWS_CONFIG_FILE",             "/dev/null"),
-            ("AWS_EC2_METADATA_DISABLED",   "true"),
-        ]
+        aws_state = []
 
     # Top: surface the Confluent principal + KEK RBAC state so the page makes
     # the security boundary visible. After the SA-split refactor, each page
@@ -1197,10 +1189,11 @@ def _render_consumer_config(env: dict[str, str], topic_key: str, role: str) -> s
     for k, v in props:
         out.append(f'<div class="row"><span class="lbl">{html.escape(k)}</span>'
                    f'<span class="val">{html.escape(str(v))}</span></div>')
-    out.append('<div class="card-sub" style="margin-top:.85rem">AWS env (subprocess)</div>')
-    for k, v in aws_state:
-        out.append(f'<div class="row"><span class="lbl">{html.escape(k)}</span>'
-                   f'<span class="val">{html.escape(str(v))}</span></div>')
+    if aws_state:
+        out.append('<div class="card-sub" style="margin-top:.85rem">AWS env (subprocess)</div>')
+        for k, v in aws_state:
+            out.append(f'<div class="row"><span class="lbl">{html.escape(k)}</span>'
+                       f'<span class="val">{html.escape(str(v))}</span></div>')
     return "\n  ".join(out)
 
 
