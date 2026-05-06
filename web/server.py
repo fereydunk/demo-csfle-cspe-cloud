@@ -1180,20 +1180,12 @@ def _render_consumer_config(env: dict[str, str], topic_key: str, role: str) -> s
     if not sa_id:
         sa_id = "(OrgAdmin fallback)"
     own_kek = env.get(f"{topic_key.upper()}_KEK_NAME", "?")
-    other_kek_name  = "CSPE_KEK_NAME" if topic_key == "csfle" else "CSFLE_KEK_NAME"
-    other_kek = env.get(other_kek_name, "?")
     if "orgadmin" in principal:
-        kek_state = (f'<span class="val empty">'
-                     f'(OrgAdmin fallback — RBAC step not yet run; KEK access via OrgAdmin role, '
-                     f'AWS-stripped env still enforces the no-KEK boundary at the AWS layer)</span>')
+        kek_state = '<span class="val empty">(OrgAdmin fallback — RBAC step not yet run)</span>'
     elif role == "authorized":
-        kek_state = (f'<span class="val">DeveloperRead on Kek:{html.escape(own_kek)} '
-                     f'<span class="kbd">only</span> · NO binding on Kek:{html.escape(other_kek)} '
-                     f'(other topic\'s KEK)</span>')
+        kek_state = f'<span class="val">DeveloperRead on Kek:{html.escape(own_kek)}</span>'
     else:
-        kek_state = ('<span class="val" style="color:#ff7b72">'
-                     'NONE — DEK Registry returns 403 for any KEK lookup '
-                     '(the Confluent-side enforcement of the no-KEK boundary)</span>')
+        kek_state = '<span class="val empty">(none)</span>'
 
     out = [
         '<div class="card-sub">Confluent identity</div>',
