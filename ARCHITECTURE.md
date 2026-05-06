@@ -202,7 +202,7 @@ Python: confluent_kafka.Consumer with cspe-consumer-no-kek SA's keys
 
 ## RBAC matrix (after card 4 step 5 runs)
 
-The wizard mints **6 service accounts** with least-privilege bindings — each consumer page's SA has access to ONLY its own KEK. Cross-topic KEK access is impossible by design.
+The wizard mints **6 service accounts** with least-privilege bindings — each consumer page's SA has access to ONLY its own KEK. Cross-topic KEK access is impossible by design. (The CSFLE2 add-on adds 5 more SAs — see the CSFLE2 section below.)
 
 | SA | Topic | Subject | Group | KEK |
 |---|---|---|---|---|
@@ -242,3 +242,30 @@ The demo deliberately enforces the no-KEK boundary at BOTH layers:
 | **AWS IAM (KMS)** | no-KEK consumer subprocess has AWS_* env stripped → KMS denies | If Confluent RBAC ever drifted (admin accidentally granted DevRead on Kek:*), the AWS layer still denies — DEK retrieved but unwrap fails |
 
 Defense in depth — neither layer alone is sufficient; together they make the no-KEK guarantee robust to misconfiguration on either side.
+
+## CSFLE2 — multi-rule per schema (PII + PCI)
+
+The CSFLE2 add-on registers a single subject (`${CSFLE2_TOPIC}-value`) with TWO `domainRules`, each `ENCRYPT`, each scoped to a different tag and KEK:
+
+| Rule | Tag | KEK | Encrypts |
+|---|---|---|---|
+| `encryptPII` | `PII` | `mortgage-csfle2-pii-kek` | `ssn` |
+| `encryptPCI` | `PCI` | `mortgage-csfle2-pci-kek` | `credit_card_number`, `card_cvv` |
+
+The schema body (field set + `required` list) is identical to `mortgage_application.json`; only the tag annotations differ. PII and PCI tags are disjoint — no field carries both — so each tagged field is encrypted exactly once and consumers don't need overlapping access.
+
+**Wire format**: each tagged field gets its own DEK reference in the encrypted ciphertext. A consumer with one KEK (say PII) can decrypt `ssn` independently of whether it has PCI access — the rule executor processes each field's encryption metadata independently and falls back to `onFailure: ERROR,NONE` (read mode = NONE) for fields whose KEK is denied.
+
+**Per-page RBAC** (after wizard card 4 step 6 runs):
+
+| SA | DevWrite (producer) / DevRead (consumer) on | Decrypts |
+|---|---|---|
+| `csfle2-producer`      | Topic + Subject + `Kek:pii` + `Kek:pci` | (writes) |
+| `csfle2-consumer-pii`  | Topic + Subject + Group + `Kek:pii` only | `ssn` only — PCI fields stay ciphertext |
+| `csfle2-consumer-pci`  | Topic + Subject + Group + `Kek:pci` only | `cc_*` only — `ssn` stays ciphertext |
+| `csfle2-consumer-both` | Topic + Subject + Group + both KEKs | all tagged fields |
+| `csfle2-consumer-none` | Topic + Subject + Group only | none — DEK Registry returns 403 for both KEKs |
+
+**Enablement requirement**: multi-rule per schema is unlocked by `PUT /config` (SR-wide) with `{"validateRules": false}` — exactly what the [docs](https://staging-docs-independent.confluent.io/docs-cloud/PR/6763/current/security/encrypt/csfle/manage-multiple-rules.html) prescribe. The setting is permissive: it allows multi-rule schemas without altering single-rule behavior, so existing CSFLE/CSPE subjects keep working unchanged. The feature is in Limited Availability — if your CC org isn't enabled, `scripts/04_setup_csfle2.sh` fails at this PUT with a 403; contact your Confluent account team to enable.
+
+**Cost**: each rule is billed separately. CSFLE2 = 2 rules = 2× encryption cost vs. a single-rule CSFLE topic.

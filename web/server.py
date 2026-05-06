@@ -31,6 +31,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import datagen
+
 PORT       = 8893
 REPO_DIR   = Path(__file__).resolve().parent.parent
 ENV_FILE   = REPO_DIR / ".env"
@@ -47,13 +49,22 @@ CONSUMER_PAGES = {
     ("csfle", "no-kek"):    ("csfle",   "unauthorized", "CSFLE Consumer — NO KEK access",           "#e63946"),
     ("cspe",  "with-kek"):  ("cspe",    "authorized",   "CSPE Consumer — KEK access",               "#3fb950"),
     ("cspe",  "no-kek"):    ("cspe",    "unauthorized", "CSPE Consumer — NO KEK access",            "#e63946"),
+    # CSFLE2 — multi-rule (PII + PCI on the same schema, two KEKs)
+    ("csfle2", "pii"):      ("csfle2",  "consumer-pii",  "CSFLE2 Consumer — PII KEK only",          "#3fb950"),
+    ("csfle2", "pci"):      ("csfle2",  "consumer-pci",  "CSFLE2 Consumer — PCI KEK only",          "#3fb950"),
+    ("csfle2", "both"):     ("csfle2",  "consumer-both", "CSFLE2 Consumer — both KEKs",             "#3fb950"),
+    ("csfle2", "none"):     ("csfle2",  "consumer-none", "CSFLE2 Consumer — NO KEK access",         "#e63946"),
 }
 
 CONSUMER_GROUPS = {
-    ("csfle", "authorized"):   "demo-csfle-with-kek-web",
-    ("csfle", "unauthorized"): "demo-csfle-no-kek-web",
-    ("cspe",  "authorized"):   "demo-cspe-with-kek-web",
-    ("cspe",  "unauthorized"): "demo-cspe-no-kek-web",
+    ("csfle", "authorized"):    "demo-csfle-with-kek-web",
+    ("csfle", "unauthorized"):  "demo-csfle-no-kek-web",
+    ("cspe",  "authorized"):    "demo-cspe-with-kek-web",
+    ("cspe",  "unauthorized"):  "demo-cspe-no-kek-web",
+    ("csfle2", "consumer-pii"):  "demo-csfle2-pii-web",
+    ("csfle2", "consumer-pci"):  "demo-csfle2-pci-web",
+    ("csfle2", "consumer-both"): "demo-csfle2-both-web",
+    ("csfle2", "consumer-none"): "demo-csfle2-none-web",
 }
 
 BOOTSTRAP_SCRIPTS = [
@@ -156,6 +167,11 @@ def _principal_keys(env: dict[str, str], topic_key: str, role: str) -> dict[str,
         "producer":          "PRODUCER",
         "consumer-with-kek": "CONSUMER_KEK",
         "consumer-no-kek":   "CONSUMER_NOKEK",
+        # CSFLE2 multi-rule: 4 consumer roles, one SA per (KEK-access) cell
+        "consumer-pii":      "CONSUMER_PII",
+        "consumer-pci":      "CONSUMER_PCI",
+        "consumer-both":     "CONSUMER_BOTH",
+        "consumer-none":     "CONSUMER_NONE",
     }.get(role)
     prefix = f"{topic_key.upper()}_{role_suffix}" if role_suffix else None
     if prefix and env.get(f"{prefix}_KAFKA_API_KEY") and env.get(f"{prefix}_SR_API_KEY"):
@@ -205,13 +221,21 @@ def _common_kafka_props(env: dict[str, str], keys: dict[str, str]) -> list[str]:
     ]
 
 
+_LEGACY_ROLE_TO_PRINCIPAL = {
+    "authorized":   "consumer-with-kek",
+    "unauthorized": "consumer-no-kek",
+}
+
+
 def _build_consumer_cmd(topic_key: str, role: str, from_beginning: bool) -> list[str]:
     env = _read_env_file(ENV_FILE)
     topic = env[f"{topic_key.upper()}_TOPIC"]
     # Per-(topic,role) principal: each consumer page uses its own SA so e.g.
     # the CSFLE-with-KEK consumer can't see the CSPE KEK and vice versa.
-    keys = _principal_keys(env, topic_key,
-                           "consumer-with-kek" if role == "authorized" else "consumer-no-kek")
+    # Legacy CSFLE/CSPE pages pass authorized/unauthorized; CSFLE2 pages pass
+    # consumer-{pii,pci,both,none} which is already the principal role name.
+    principal_role = _LEGACY_ROLE_TO_PRINCIPAL.get(role, role)
+    keys = _principal_keys(env, topic_key, principal_role)
     cmd = [str(CONSUMER), "--topic", topic,
            *_common_kafka_props(env, keys),
            *_common_sr_props(env, keys, side="consumer")]
@@ -229,15 +253,23 @@ def _build_consumer_cmd(topic_key: str, role: str, from_beginning: bool) -> list
     return cmd
 
 
+_AWS_CREDS_ROLES = {"authorized", "consumer-pii", "consumer-pci", "consumer-both"}
+
+
 def _consumer_env(role: str) -> dict[str, str]:
     """Build subprocess env. Always start from the parent env so PATH/JAVA_HOME
     propagate, then either inject AWS creds (authorized) or block them
-    (unauthorized — including IMDS to prevent EC2 instance role fallback)."""
+    (unauthorized — including IMDS to prevent EC2 instance role fallback).
+
+    For CSFLE2 multi-rule pages: pii/pci/both consumers all get AWS creds
+    (they need to call KMS for the KEKs they ARE allowed); the per-KEK
+    enforcement happens at the SR DEK Registry layer (403 for KEKs the SA
+    isn't role-bound to). Only the 'none' consumer gets AWS creds stripped."""
     env = os.environ.copy()
     env["JAVA_HOME"] = JAVA_HOME
     for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE"):
         env.pop(k, None)
-    if role == "authorized":
+    if role in _AWS_CREDS_ROLES:
         env.update(_aws_creds())
     else:
         env["AWS_SHARED_CREDENTIALS_FILE"] = "/dev/null"
@@ -352,7 +384,7 @@ def _fetch_schema_info(env: dict[str, str], subject: str) -> dict:
     # CSFLE uses domainRules, CSPE uses encodingRules — show whichever's present
     rules = rs.get("domainRules") or rs.get("encodingRules") or []
     out = {"id": d.get("id", ""), "version": d.get("version", "")}
-    if rules:
+    if len(rules) == 1:
         r = rules[0]
         params = r.get("params") or {}
         tags = r.get("tags") or []
@@ -361,6 +393,19 @@ def _fetch_schema_info(env: dict[str, str], subject: str) -> dict:
             "scope":     ",".join(tags) if tags else "payload",
             "kek":       params.get("encrypt.kek.name", ""),
             "algo":      params.get("encrypt.algorithm", ""),
+        })
+    elif len(rules) > 1:
+        # Multi-rule (CSFLE2): summarize all rules in one line
+        summaries = []
+        for r in rules:
+            tags = r.get("tags") or []
+            kek  = (r.get("params") or {}).get("encrypt.kek.name", "?")
+            summaries.append(f"{','.join(tags) or 'payload'}→{kek}")
+        out.update({
+            "rule_type": f"{len(rules)} × {rules[0].get('type','')}",
+            "scope":     " + ".join(summaries),
+            "kek":       "",   # already in scope summary
+            "algo":      (rules[0].get("params") or {}).get("encrypt.algorithm", ""),
         })
     return out
 
@@ -705,6 +750,12 @@ NAV_LINKS = [
     ("cspe-prod",    "/produce/cspe",       "CSPE Producer"),
     ("cspe-auth",    "/cspe/with-kek",      "CSPE w/ KEK"),
     ("cspe-noauth",  "/cspe/no-kek",        "CSPE no KEK"),
+    # CSFLE2 — multi-rule (PII + PCI on same schema, two KEKs)
+    ("csfle2-prod",  "/produce/csfle2",     "CSFLE2 Producer"),
+    ("csfle2-pii",   "/csfle2/pii",         "CSFLE2 PII-only"),
+    ("csfle2-pci",   "/csfle2/pci",         "CSFLE2 PCI-only"),
+    ("csfle2-both",  "/csfle2/both",        "CSFLE2 both"),
+    ("csfle2-none",  "/csfle2/none",        "CSFLE2 none"),
 ]
 
 
@@ -733,7 +784,7 @@ def _render_schema_rows(env: dict[str, str]) -> str:
     Empty string when SR isn't reachable yet (keeps the card lean before
     setup runs)."""
     rows = []
-    for label, topic_key in (("CSFLE", "csfle"), ("CSPE", "cspe")):
+    for label, topic_key in (("CSFLE", "csfle"), ("CSPE", "cspe"), ("CSFLE2", "csfle2")):
         topic = env.get(f"{topic_key.upper()}_TOPIC")
         if not topic:
             continue
@@ -839,8 +890,10 @@ def build_wizard_page() -> str:
   <select id="cluster-pick" style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:.4rem;border-radius:4px;font-size:.83rem">
     <option value="">(pick an env first)</option>
   </select>
-  <label>CSFLE topic name</label> <input type="text" id="csfle-topic" value="{html.escape(env.get('CSFLE_TOPIC') or 'mortgage-csfle')}">
-  <label>CSPE topic name</label>  <input type="text" id="cspe-topic"  value="{html.escape(env.get('CSPE_TOPIC')  or 'mortgage-cspe')}">
+  <label>CSFLE topic name</label>  <input type="text" id="csfle-topic"  value="{html.escape(env.get('CSFLE_TOPIC')  or 'mortgage-csfle')}">
+  <label>CSPE topic name</label>   <input type="text" id="cspe-topic"   value="{html.escape(env.get('CSPE_TOPIC')   or 'mortgage-cspe')}">
+  <label>CSFLE2 topic name (multi-rule: PII + PCI)</label>
+                                   <input type="text" id="csfle2-topic" value="{html.escape(env.get('CSFLE2_TOPIC') or 'mortgage-csfle2')}">
   <div class="btn-row">
     <button class="btn" onclick="savePick()">Save &amp; mint API keys</button>
     <span id="pick-msg" class="card-sub" style="margin:0"></span>
@@ -858,6 +911,12 @@ def build_wizard_page() -> str:
     <button class="btn btn-secondary" onclick="runRbac()">5 · RBAC</button>
     <button class="btn" onclick="runAll()">Run all</button>
   </div>
+  <div class="card-sub" style="margin-top:.85rem">
+    <strong>CSFLE2 multi-rule add-on</strong> runs as the final step of <em>Run all</em> (additive — no impact on existing CSFLE/CSPE).
+    Creates 2 more KEKs (PII + PCI), registers the multi-rule schema with two <code>ENCRYPT</code> rules,
+    creates the CSFLE2 topic, mints 5 more SAs (producer + 4 consumers w/ different KEK access).
+    Requires the multi-rule per-schema feature (Limited Availability).
+  </div>
   <div id="setup-log" class="log" style="display:none"></div>
 </div>
 
@@ -873,6 +932,11 @@ def build_wizard_page() -> str:
   {row("CSPE_TOPIC",        env.get("CSPE_TOPIC",""))}
   {row("CSPE_KEK_NAME",     env.get("CSPE_KEK_NAME",""))}
   {row("CSPE_KMS_ARN",      env.get("CSPE_KMS_ARN",""))}
+  {row("CSFLE2_TOPIC",        env.get("CSFLE2_TOPIC",""))}
+  {row("CSFLE2_PII_KEK_NAME", env.get("CSFLE2_PII_KEK_NAME",""))}
+  {row("CSFLE2_PII_KMS_ARN",  env.get("CSFLE2_PII_KMS_ARN",""))}
+  {row("CSFLE2_PCI_KEK_NAME", env.get("CSFLE2_PCI_KEK_NAME",""))}
+  {row("CSFLE2_PCI_KMS_ARN",  env.get("CSFLE2_PCI_KMS_ARN",""))}
   {_render_schema_rows(env)}
 </div>
 
@@ -972,8 +1036,9 @@ function savePick() {{
     env_id, cluster_id,
     env_name:     envSel.options[envSel.selectedIndex].dataset.name || '',
     cluster_name: clusSel.options[clusSel.selectedIndex].dataset.name || '',
-    csfle_topic: document.getElementById('csfle-topic').value,
-    cspe_topic:  document.getElementById('cspe-topic').value,
+    csfle_topic:  document.getElementById('csfle-topic').value,
+    cspe_topic:   document.getElementById('cspe-topic').value,
+    csfle2_topic: document.getElementById('csfle2-topic').value,
   }});
   document.getElementById('pick-msg').textContent = 'saving + minting keys…';
   fetch('/cc-pick', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body}})
@@ -1014,8 +1079,9 @@ function _runSse(url, label) {{
     }};
   }});
 }}
-function runSg()    {{ return _runSse('/bootstrap-sg',           'step 1 · Stream Governance'); }}
-function runRbac()  {{ return _runSse('/bootstrap-rbac',         'step 5 · RBAC'); }}
+function runSg()     {{ return _runSse('/bootstrap-sg',          'step 1 · Stream Governance'); }}
+function runRbac()   {{ return _runSse('/bootstrap-rbac',        'step 5 · RBAC'); }}
+function runCsfle2() {{ return _runSse('/bootstrap-csfle2',      'CSFLE2 multi-rule add-on'); }}
 function runStep(n) {{
   // n=0 → KEKs (step 2); n=1 → schemas (step 3); n=2 → topics (step 4)
   const labels = ['2 · KEKs', '3 · schemas', '4 · topics'];
@@ -1025,10 +1091,11 @@ function runStep(n) {{
 async function runAll() {{
   // Build infrastructure first, grant access last.
   let ok = await runSg();    if (!ok) {{ _stop(); return; }}    // 1 SG
-  ok = await runStep(0);     if (!ok) {{ _stop(); return; }}    // 2 KEKs
-  ok = await runStep(1);     if (!ok) {{ _stop(); return; }}    // 3 schemas
-  ok = await runStep(2);     if (!ok) {{ _stop(); return; }}    // 4 topics
-  ok = await runRbac();      if (!ok) {{ _stop(); return; }}    // 5 RBAC (last — binds against existing resources)
+  ok = await runStep(0);     if (!ok) {{ _stop(); return; }}    // 2 KEKs    (CSFLE + CSPE)
+  ok = await runStep(1);     if (!ok) {{ _stop(); return; }}    // 3 schemas (CSFLE + CSPE)
+  ok = await runStep(2);     if (!ok) {{ _stop(); return; }}    // 4 topics  (CSFLE + CSPE)
+  ok = await runRbac();      if (!ok) {{ _stop(); return; }}    // 5 RBAC    (CSFLE + CSPE — 6 SAs)
+  ok = await runCsfle2();    if (!ok) {{ _stop(); return; }}    // CSFLE2 add-on: 2 KEKs + multi-rule schema + topic + 5 SAs
 }}
 function _stop() {{ document.getElementById('setup-log').textContent += '— STOPPING —\\n'; }}
 
@@ -1039,8 +1106,7 @@ ccStatus();
 
 def build_producer_page(topic_key: str) -> str:
     env = _read_env_file(ENV_FILE)
-    sample = (REPO_DIR / "data" / "mortgage-records.json").read_text().splitlines()
-    sample_count = len(sample)
+    sample_count = 20  # default batch size; UI clamp goes up to MAX_RECORDS
     topic   = env.get(f"{topic_key.upper()}_TOPIC") or f"mortgage-{topic_key}"
     subject = f"{topic}-value"
     if topic_key == "csfle":
@@ -1054,7 +1120,7 @@ def build_producer_page(topic_key: str) -> str:
         consumers   = ('<a href="/csfle/with-kek">→ CSFLE w/ KEK consumer</a>'
                        ' &middot; <a href="/csfle/no-kek">→ CSFLE no-KEK consumer</a>')
         nav_key     = "csfle-prod"
-    else:
+    elif topic_key == "cspe":
         title       = "CSPE Producer"
         scheme      = "payload encryption"
         explainer   = ("Entire serialized JSON value encrypted client-side; record structure is "
@@ -1065,6 +1131,22 @@ def build_producer_page(topic_key: str) -> str:
         consumers   = ('<a href="/cspe/with-kek">→ CSPE w/ KEK consumer</a>'
                        ' &middot; <a href="/cspe/no-kek">→ CSPE no-KEK consumer</a>')
         nav_key     = "cspe-prod"
+    else:  # csfle2 — multi-rule (PII + PCI on the same schema)
+        title       = "CSFLE2 Producer"
+        scheme      = "multi-rule field-level encryption (PII + PCI)"
+        explainer   = ('<span class="kbd">ssn</span> encrypted under the PII KEK; '
+                       '<span class="kbd">credit_card_number</span> + <span class="kbd">card_cvv</span> '
+                       'encrypted under the PCI KEK. Two <code>ruleSet.domainRules</code> entries fire '
+                       'on every produce — one matches the <code>PII</code> tag, the other the '
+                       '<code>PCI</code> tag. Each tagged field carries its own DEK reference, so '
+                       'consumers with partial KEK access decrypt only the fields they\'re entitled to '
+                       '(see the 4 consumer pages below).')
+        accent      = "#58a6ff"
+        consumers   = ('<a href="/csfle2/pii">→ PII KEK only</a>'
+                       ' &middot; <a href="/csfle2/pci">→ PCI KEK only</a>'
+                       ' &middot; <a href="/csfle2/both">→ both KEKs</a>'
+                       ' &middot; <a href="/csfle2/none">→ no KEK access</a>')
+        nav_key     = "csfle2-prod"
     safe_topic = html.escape(topic)
     body = f"""
 <header class="accent"><h1>{html.escape(title)}</h1>
@@ -1079,8 +1161,8 @@ def build_producer_page(topic_key: str) -> str:
 <div class="card">
   <div class="card-title">Produce</div>
   <div class="card-sub">{explainer}</div>
-  <label>How many records to send (max {sample_count} from the sample file)</label>
-  <input type="number" id="count" value="{sample_count}" min="1" max="{sample_count}" style="max-width:8rem">
+  <label>How many records to send (generated fresh from the live schema)</label>
+  <input type="number" id="count" value="{sample_count}" min="1" max="100" style="max-width:8rem">
   <div class="btn-row">
     <button class="btn" onclick="produce()">→ Produce to {safe_topic}</button>
     <span class="card-sub" style="margin:0">Then check: {consumers}</span>
@@ -1089,7 +1171,7 @@ def build_producer_page(topic_key: str) -> str:
 </div>
 
 <script>
-const MAX_RECORDS = {sample_count};
+const MAX_RECORDS = 100;
 function produce() {{
   // Clamp to the sample-file size so the UI label matches what the backend
   // actually sends (backend silently caps at file length).
@@ -1126,8 +1208,7 @@ def _render_consumer_config(env: dict[str, str], topic_key: str, role: str) -> s
     if not env.get("KAFKA_API_KEY") or not env.get("SR_URL"):
         return ('<div class="card-sub" style="color:#d29922">'
                 '(consumer not yet configured — finish setup first)</div>')
-    keys = _principal_keys(env, topic_key,
-                           "consumer-with-kek" if role == "authorized" else "consumer-no-kek")
+    keys = _principal_keys(env, topic_key, _LEGACY_ROLE_TO_PRINCIPAL.get(role, role))
     principal = keys.get("principal", "?")
     sa_id = keys.get("sa_id", "")
     group_base = CONSUMER_GROUPS[(topic_key, role)]
@@ -1152,8 +1233,10 @@ def _render_consumer_config(env: dict[str, str], topic_key: str, role: str) -> s
     ]
 
     # AWS env — only relevant when KEK access is granted (no-KEK consumers
-    # don't interact with KMS at all, so the AWS env state is noise).
-    if role == "authorized":
+    # don't interact with KMS at all, so the AWS env state is noise). For
+    # CSFLE2 partial-access consumers (pii/pci/both) AWS creds are present;
+    # the per-KEK enforcement is at the SR DEK Registry layer.
+    if role in _AWS_CREDS_ROLES:
         aws = _aws_creds()
         aws_state = [
             ("AWS_ACCESS_KEY_ID",     aws.get("AWS_ACCESS_KEY_ID", "(none — KMS unwrap will fail)")),
@@ -1171,10 +1254,23 @@ def _render_consumer_config(env: dict[str, str], topic_key: str, role: str) -> s
     # versa).
     if not sa_id:
         sa_id = "(OrgAdmin fallback)"
-    own_kek = env.get(f"{topic_key.upper()}_KEK_NAME", "?")
     if "orgadmin" in principal:
         kek_state = '<span class="val empty">(OrgAdmin fallback — RBAC step not yet run)</span>'
+    elif topic_key == "csfle2":
+        # CSFLE2 has TWO KEKs (PII + PCI); each consumer page binds to a
+        # specific subset.
+        pii_kek = env.get("CSFLE2_PII_KEK_NAME", "?")
+        pci_kek = env.get("CSFLE2_PCI_KEK_NAME", "?")
+        if role == "consumer-pii":
+            kek_state = f'<span class="val">DeveloperRead on Kek:{html.escape(pii_kek)} only (NO Kek:{html.escape(pci_kek)})</span>'
+        elif role == "consumer-pci":
+            kek_state = f'<span class="val">DeveloperRead on Kek:{html.escape(pci_kek)} only (NO Kek:{html.escape(pii_kek)})</span>'
+        elif role == "consumer-both":
+            kek_state = f'<span class="val">DeveloperRead on Kek:{html.escape(pii_kek)} AND Kek:{html.escape(pci_kek)}</span>'
+        else:  # consumer-none
+            kek_state = '<span class="val empty">(none — DEK Registry returns 403 on every field)</span>'
     elif role == "authorized":
+        own_kek = env.get(f"{topic_key.upper()}_KEK_NAME", "?")
         kek_state = f'<span class="val">DeveloperRead on Kek:{html.escape(own_kek)}</span>'
     else:
         kek_state = '<span class="val empty">(none)</span>'
@@ -1197,12 +1293,22 @@ def _render_consumer_config(env: dict[str, str], topic_key: str, role: str) -> s
     return "\n  ".join(out)
 
 
+_ROLE_TO_SLUG = {
+    "authorized":     ("with-kek", "auth"),
+    "unauthorized":   ("no-kek",   "noauth"),
+    "consumer-pii":   ("pii",      "pii"),
+    "consumer-pci":   ("pci",      "pci"),
+    "consumer-both":  ("both",     "both"),
+    "consumer-none":  ("none",     "none"),
+}
+
+
 def build_consumer_page(topic_key: str, role: str, title: str, accent: str) -> str:
     env   = _read_env_file(ENV_FILE)
     topic = env.get(f"{topic_key.upper()}_TOPIC", "")
-    nav_key = f"{topic_key}-{'auth' if role == 'authorized' else 'noauth'}"
+    slug, nav_suffix = _ROLE_TO_SLUG[role]
+    nav_key = f"{topic_key}-{nav_suffix}"
     opaque_class = "true" if (topic_key == "cspe" and role == "unauthorized") else "false"
-    slug = "with-kek" if role == "authorized" else "no-kek"
     body = f"""
 <header class="accent"><h1>{html.escape(title)}</h1>
   <div class="sub">topic <span class="kbd">{html.escape(topic)}</span></div>
@@ -1338,6 +1444,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_html(build_producer_page("csfle")); return
         if path == "/produce/cspe":
             self._send_html(build_producer_page("cspe")); return
+        if path == "/produce/csfle2":
+            self._send_html(build_producer_page("csfle2")); return
         if path == "/produce":
             # Backward-compat: old single producer URL → redirect to CSFLE producer
             self.send_response(302); self.send_header("Location", "/produce/csfle")
@@ -1378,6 +1486,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/bootstrap-rbac":
             self._stream_rbac_setup(); return
 
+        if path == "/bootstrap-csfle2":
+            # CSFLE2 multi-rule setup: runs scripts/04_setup_csfle2.sh
+            # (KEKs + validateRules + schema + topic) then mints the 5 CSFLE2
+            # service accounts with per-KEK RBAC.
+            self._stream_csfle2_setup(); return
+
         if path == "/produce-stream":
             qs = parse_qs(parsed.query)
             topic_key = qs.get("topic", ["csfle"])[0]
@@ -1389,12 +1503,14 @@ class Handler(BaseHTTPRequestHandler):
             if path == f"/{topic_key}/{slug}":
                 self._send_html(build_consumer_page(topic_key, role, title, accent)); return
 
-        # Consumer SSE stream
+        # Consumer SSE stream — drives all CSFLE/CSPE/CSFLE2 consumer pages off
+        # the single CONSUMER_PAGES table so adding a new page is one entry, not
+        # a new branch here.
         if path.startswith("/sse/"):
             parts = path.removeprefix("/sse/").split("/")
-            if len(parts) == 2 and parts[0] in ("csfle", "cspe") and parts[1] in ("with-kek", "no-kek"):
-                topic_key = parts[0]
-                role = "authorized" if parts[1] == "with-kek" else "unauthorized"
+            key = (parts[0], parts[1]) if len(parts) == 2 else None
+            if key in CONSUMER_PAGES:
+                topic_key, role, _, _ = CONSUMER_PAGES[key]
                 from_beginning = "from_beginning" in parse_qs(parsed.query)
                 self._stream_consumer(topic_key, role, from_beginning)
                 return
@@ -1442,8 +1558,9 @@ class Handler(BaseHTTPRequestHandler):
                 env_name = body.get("env_name", "")
                 cluster_id   = body["cluster_id"]
                 cluster_name = body.get("cluster_name", "")
-                csfle_topic  = body.get("csfle_topic", "mortgage-csfle").strip() or "mortgage-csfle"
-                cspe_topic   = body.get("cspe_topic",  "mortgage-cspe" ).strip() or "mortgage-cspe"
+                csfle_topic  = body.get("csfle_topic",  "mortgage-csfle" ).strip() or "mortgage-csfle"
+                cspe_topic   = body.get("cspe_topic",   "mortgage-cspe"  ).strip() or "mortgage-cspe"
+                csfle2_topic = body.get("csfle2_topic", "mortgage-csfle2").strip() or "mortgage-csfle2"
 
                 cluster = _cc_describe_cluster(env_id, cluster_id)
                 bootstrap = (cluster.get("endpoint") or "").replace("SASL_SSL://", "")
@@ -1476,6 +1593,7 @@ class Handler(BaseHTTPRequestHandler):
                     "SR_URL":            sr["url"],
                     "CSFLE_TOPIC":       csfle_topic,
                     "CSPE_TOPIC":        cspe_topic,
+                    "CSFLE2_TOPIC":      csfle2_topic,
                 }
                 cluster_changed = current.get("CLUSTER_ID") and current.get("CLUSTER_ID") != cluster_id
                 sr_changed      = current.get("SR_ID")      and current.get("SR_ID")      != sr["id"]
@@ -1734,6 +1852,168 @@ class Handler(BaseHTTPRequestHandler):
             self._sse_data({"line": f"ERROR: {e}"})
             self._sse_data({"ok": False, "rc": -1}, event="done")
 
+    def _stream_csfle2_setup(self) -> None:
+        """One-shot CSFLE2 setup: runs scripts/04_setup_csfle2.sh (KEKs +
+        validateRules + multi-rule schema + topic), then mints the 5 CSFLE2
+        service accounts with per-KEK role bindings:
+
+          csfle2-producer      → DevWrite Topic + Subject + Kek:pii + Kek:pci
+          csfle2-consumer-pii  → DevRead  Topic + Subject + Group + Kek:pii          (NO Kek:pci)
+          csfle2-consumer-pci  → DevRead  Topic + Subject + Group + Kek:pci          (NO Kek:pii)
+          csfle2-consumer-both → DevRead  Topic + Subject + Group + Kek:pii + Kek:pci
+          csfle2-consumer-none → DevRead  Topic + Subject + Group                    (NO Kek:* — DEK Registry returns 403)
+
+        Persists 25 entries to .env: 5 SAs × 5 vars each. Idempotent — skips
+        any SA whose keys are already in .env. Existing CSFLE/CSPE SAs are
+        not touched."""
+        self._start_sse()
+        try:
+            # Phase 1: run scripts/04_setup_csfle2.sh, stream stdout via SSE.
+            self._sse_data({"line": "══ Phase 1: KEKs + schema + topic ══"})
+            sub_env = os.environ.copy()
+            sub_env["JAVA_HOME"] = JAVA_HOME
+            sub_env.update(_aws_creds())
+            proc = subprocess.Popen(
+                ["bash", str(REPO_DIR / "scripts" / "04_setup_csfle2.sh")],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, env=sub_env,
+            )
+            for line in proc.stdout:
+                if not self._sse_data({"line": line.rstrip()}):
+                    proc.kill()
+                    return
+            rc = proc.wait()
+            if rc != 0:
+                self._sse_data({"line": f"\n✗ scripts/04_setup_csfle2.sh exited rc={rc}"})
+                self._sse_data({"ok": False, "rc": rc}, event="done")
+                return
+
+            # Phase 2: mint 5 SAs with per-KEK bindings.
+            self._sse_data({"line": "\n══ Phase 2: service accounts + role bindings ══"})
+            env = _read_env_file(ENV_FILE)
+            for k in ("ENV_ID", "CLUSTER_ID", "SR_ID",
+                      "CSFLE2_TOPIC",
+                      "CSFLE2_PII_KEK_NAME", "CSFLE2_PCI_KEK_NAME"):
+                if not env.get(k):
+                    self._sse_data({"line": f"✗ {k} missing — phase 1 must populate it"})
+                    self._sse_data({"ok": False, "rc": -1}, event="done")
+                    return
+            env_id  = env["ENV_ID"]
+            cluster = env["CLUSTER_ID"]
+            sr      = env["SR_ID"]
+            topic   = env["CSFLE2_TOPIC"]
+            pii_k   = env["CSFLE2_PII_KEK_NAME"]
+            pci_k   = env["CSFLE2_PCI_KEK_NAME"]
+
+            specs = {
+                "csfle2-producer": [
+                    ("DeveloperWrite", f"Topic:{topic}",          "kafka", False),
+                    ("DeveloperWrite", f"Subject:{topic}-value",  "sr",    False),
+                    ("DeveloperWrite", f"Kek:{pii_k}",            "sr",    False),
+                    ("DeveloperWrite", f"Kek:{pci_k}",            "sr",    False),
+                ],
+                "csfle2-consumer-pii": [
+                    ("DeveloperRead",  f"Topic:{topic}",          "kafka", False),
+                    ("DeveloperRead",  "Group:demo-csfle2-pii",   "kafka", True),
+                    ("DeveloperRead",  f"Subject:{topic}-value",  "sr",    False),
+                    ("DeveloperRead",  f"Kek:{pii_k}",            "sr",    False),  # NO pci
+                ],
+                "csfle2-consumer-pci": [
+                    ("DeveloperRead",  f"Topic:{topic}",          "kafka", False),
+                    ("DeveloperRead",  "Group:demo-csfle2-pci",   "kafka", True),
+                    ("DeveloperRead",  f"Subject:{topic}-value",  "sr",    False),
+                    ("DeveloperRead",  f"Kek:{pci_k}",            "sr",    False),  # NO pii
+                ],
+                "csfle2-consumer-both": [
+                    ("DeveloperRead",  f"Topic:{topic}",          "kafka", False),
+                    ("DeveloperRead",  "Group:demo-csfle2-both",  "kafka", True),
+                    ("DeveloperRead",  f"Subject:{topic}-value",  "sr",    False),
+                    ("DeveloperRead",  f"Kek:{pii_k}",            "sr",    False),
+                    ("DeveloperRead",  f"Kek:{pci_k}",            "sr",    False),
+                ],
+                "csfle2-consumer-none": [
+                    ("DeveloperRead",  f"Topic:{topic}",          "kafka", False),
+                    ("DeveloperRead",  "Group:demo-csfle2-none",  "kafka", True),
+                    ("DeveloperRead",  f"Subject:{topic}-value",  "sr",    False),
+                    # NO Kek bindings.
+                ],
+            }
+            env_prefix = {
+                "csfle2-producer":       "CSFLE2_PRODUCER",
+                "csfle2-consumer-pii":   "CSFLE2_CONSUMER_PII",
+                "csfle2-consumer-pci":   "CSFLE2_CONSUMER_PCI",
+                "csfle2-consumer-both":  "CSFLE2_CONSUMER_BOTH",
+                "csfle2-consumer-none":  "CSFLE2_CONSUMER_NONE",
+            }
+
+            updates: dict[str, str] = {}
+            for role, bindings in specs.items():
+                sa_name = self._sa_name(role, env_id)
+                self._sse_data({"line": f"\n══ {role} ══"})
+                self._sse_data({"line": f"→ ensuring service account {sa_name}"})
+                sa = _cc_create_service_account(
+                    sa_name, f"demo-csfle-cspe-cloud — {role} principal")
+                sa_id = sa["id"]
+                self._sse_data({"line": f"  ✓ {sa_id}"})
+                updates[f"{env_prefix[role]}_SA_ID"] = sa_id
+
+                kk = f"{env_prefix[role]}_KAFKA_API_KEY"
+                ks = f"{env_prefix[role]}_KAFKA_API_SECRET"
+                sk = f"{env_prefix[role]}_SR_API_KEY"
+                ss = f"{env_prefix[role]}_SR_API_SECRET"
+                if not env.get(kk):
+                    self._sse_data({"line": f"→ minting Kafka API key for {sa_id}"})
+                    rc, out, err = _run_confluent(
+                        ["api-key", "create",
+                         "--resource", cluster, "--environment", env_id,
+                         "--service-account", sa_id,
+                         "--description", f"demo-csfle-cspe-cloud {role} (kafka)",
+                         "-o", "json"], timeout=30,
+                    )
+                    if rc != 0:
+                        raise RuntimeError(f"kafka api-key create for {sa_id}: {(err or out).strip()}")
+                    k = json.loads(out)
+                    updates[kk] = k["api_key"]; updates[ks] = k["api_secret"]
+                    self._sse_data({"line": f"  ✓ {k['api_key']}"})
+                else:
+                    self._sse_data({"line": f"  ✓ Kafka key already in .env ({env[kk]})"})
+                if not env.get(sk):
+                    self._sse_data({"line": f"→ minting SR API key for {sa_id}"})
+                    rc, out, err = _run_confluent(
+                        ["api-key", "create",
+                         "--resource", sr, "--environment", env_id,
+                         "--service-account", sa_id,
+                         "--description", f"demo-csfle-cspe-cloud {role} (sr)",
+                         "-o", "json"], timeout=30,
+                    )
+                    if rc != 0:
+                        raise RuntimeError(f"sr api-key create for {sa_id}: {(err or out).strip()}")
+                    k = json.loads(out)
+                    updates[sk] = k["api_key"]; updates[ss] = k["api_secret"]
+                    self._sse_data({"line": f"  ✓ {k['api_key']}"})
+                else:
+                    self._sse_data({"line": f"  ✓ SR key already in .env ({env[sk]})"})
+
+                for r_role, resource, scope, prefixed in bindings:
+                    kw: dict = {"prefixed": prefixed}
+                    if scope == "kafka":
+                        kw["kafka_cluster"] = cluster
+                    elif scope == "sr":
+                        kw["sr_cluster"] = sr
+                    ok, msg = _cc_role_binding_create(sa_id, r_role, resource, env_id, **kw)
+                    marker = "✓" if ok else "✗"
+                    pat = " (prefix)" if prefixed else ""
+                    self._sse_data({"line": f"  {marker} {r_role:<15} {resource:<35} ({scope}){pat}"})
+                    if not ok:
+                        self._sse_data({"line": f"    {msg}"})
+
+            _upsert_env(updates)
+            self._sse_data({"line": f"\n✓ wrote {len(updates)} entries to .env"})
+            self._sse_data({"ok": True, "rc": 0}, event="done")
+        except Exception as e:
+            self._sse_data({"line": f"ERROR: {e}"})
+            self._sse_data({"ok": False, "rc": -1}, event="done")
+
     def _stream_sg_upgrade(self) -> None:
         """Verify Stream Governance is on ADVANCED for the env in .env;
         upgrade via SRCM v3 PATCH if it isn't. Streams progress via SSE."""
@@ -1788,9 +2068,15 @@ class Handler(BaseHTTPRequestHandler):
         env["JAVA_HOME"] = JAVA_HOME
         env.update(_aws_creds())    # wrap/unwrap DEKs via AWS KMS
 
-        data_path = REPO_DIR / "data" / "mortgage-records.json"
-        records = [ln for ln in data_path.read_text().splitlines() if ln.strip()][:count]
-        topic = _read_env_file(ENV_FILE).get(f"{topic_key.upper()}_TOPIC", "?")
+        env_kv = _read_env_file(ENV_FILE)
+        topic = env_kv.get(f"{topic_key.upper()}_TOPIC", "?")
+        try:
+            records = list(datagen.generate(env_kv, topic_key, count))
+        except Exception as e:
+            self._start_sse()
+            self._sse_data({"line": f"ERROR: datagen failed ({e}) — is the schema registered? Run setup card 4 step 3."})
+            self._sse_data({"ok": False, "rc": -1}, event="done")
+            return
 
         self._start_sse()
         self._sse_data({"line": f"▶ producing {len(records)} records to {topic}"})

@@ -2,7 +2,7 @@
 
 Side-by-side demo of Confluent Cloud's two **client-side** encryption modes — both running entirely on **Confluent Cloud**, both with the customer holding the KEK in **AWS KMS** (KEK never shared with Confluent), both using the native **Schema Registry rule executor framework** so all encryption policy lives in SR, versioned per schema.
 
-Two topics. Six service accounts. One demo. Encryption is enforced both at the **Confluent layer** (per-KEK RBAC) and at the **AWS layer** (KMS Decrypt), so the no-KEK consumer pages demonstrate the security boundary at both layers simultaneously.
+Two topics, six service accounts in the core demo — plus an optional **CSFLE2** multi-rule add-on (third topic, two more KEKs, five more SAs) that demonstrates two encryption rules on a single schema (PII + PCI under different KEKs). Encryption is enforced both at the **Confluent layer** (per-KEK RBAC) and at the **AWS layer** (KMS Decrypt), so the no-KEK consumer pages demonstrate the security boundary at both layers simultaneously.
 
 | | CSFLE — Client-Side **Field-Level** Encryption | CSPE — Client-Side **Payload** Encryption |
 |---|---|---|
@@ -48,9 +48,9 @@ Walk the 4 cards top to bottom:
    - **4 · topics** — `confluent kafka topic create` × 2
    - **5 · RBAC (last)** — mints **6 service accounts** (one per (topic, role) pair), 12 API keys (Kafka + SR per SA), and role bindings against the now-existing resources. Producer SAs get `DeveloperWrite` on Topic + Subject + their KEK. Consumer-with-KEK SAs get `DeveloperRead` on Topic + Subject + Group + **their own KEK only** (CSFLE consumer can't see CSPE KEK and vice versa). Consumer-no-KEK SAs get `DeveloperRead` on Topic + Subject + Group only — **no Kek binding** → SR returns 403 on DEK lookup → records fail to decrypt at the Confluent layer.
 
-After bootstrap, 6 nav routes:
+After bootstrap, 6 nav routes (plus 5 more if the CSFLE2 add-on ran — see below):
 
-- **CSFLE Producer** (`/produce/csfle`): pick how many records (1 to 20 from the sample file), click Produce. Each record streamed inline.
+- **CSFLE Producer** (`/produce/csfle`): pick how many records (1 to 100, generated fresh from the live schema by `web/datagen.py`), click Produce. Each record streamed inline.
 - **CSPE Producer** (`/produce/cspe`): same flow.
 - **CSFLE w/ KEK** (`/csfle/with-kek`): consumer with AWS creds in env. Click "Start (from beginning)".
 - **CSFLE no KEK** (`/csfle/no-kek`): consumer with AWS creds STRIPPED + SA without Kek RBAC. Records arrive with `ssn` as base64 ciphertext.
@@ -67,6 +67,40 @@ After bootstrap, 6 nav routes:
 | `/cspe/no-kek`    | (not separately visible) | `{"__raw__": "<opaque base64>"}` — entire payload encrypted |
 
 That contrast is the demo's point: **CSFLE gives unauthorized consumers partial visibility** (record structure + non-PII fields) — useful when downstream tooling needs to route/filter on non-PII columns; **CSPE gives them nothing** — useful when even the existence of fields is sensitive.
+
+## CSFLE2 — multi-rule encryption (PII + PCI on the same schema)
+
+Optional add-on demonstrating **multiple encryption rules per schema** ([docs](https://staging-docs-independent.confluent.io/docs-cloud/PR/6763/current/security/encrypt/csfle/manage-multiple-rules.html) — Limited Availability feature, may need account-team enablement). Same field set as CSFLE/CSPE; new tags + a second KEK.
+
+| | CSFLE2 — Multi-Rule Field-Level Encryption |
+|---|---|
+| Rules | 2 × `ENCRYPT` in `ruleSet.domainRules` |
+| Tag → KEK mapping | `["PII"]` → `mortgage-csfle2-pii-kek` (encrypts `ssn`) · `["PCI"]` → `mortgage-csfle2-pci-kek` (encrypts `credit_card_number`, `card_cvv`) |
+| Topic | `mortgage-csfle2` (renameable) |
+| Schema | `schemas/mortgage_application_csfle2.json` (same fields as the others; only the tag annotations differ) |
+| Producer SA | `csfle2-producer` (DevWrite on Topic + Subject + both KEKs) |
+| Consumer SAs (4) | `csfle2-consumer-pii` / `csfle2-consumer-pci` / `csfle2-consumer-both` / `csfle2-consumer-none` |
+| SR config | `validateRules=false` PUT on the SR-wide `/config` endpoint (permissive — single-rule subjects keep working unchanged) |
+| Billing | Each rule billed separately — CSFLE2 = 2 rules = 2× encryption cost |
+
+**Setup**: wizard card 4 step **6 · CSFLE2 setup** runs `scripts/04_setup_csfle2.sh` then mints the 5 service accounts. Existing CSFLE/CSPE setup is not touched.
+
+5 new nav routes:
+
+- **CSFLE2 Producer** (`/produce/csfle2`): produces records with both PII and PCI tagged fields encrypted under their respective KEKs.
+- **CSFLE2 PII-only** (`/csfle2/pii`): consumer with `Kek:pii` only.
+- **CSFLE2 PCI-only** (`/csfle2/pci`): consumer with `Kek:pci` only.
+- **CSFLE2 both** (`/csfle2/both`): consumer with both KEKs.
+- **CSFLE2 none** (`/csfle2/none`): consumer with no KEK access.
+
+| Page | `ssn` (PII) | `credit_card_number` + `card_cvv` (PCI) |
+|---|---|---|
+| `/csfle2/pii`  | plaintext | base64 ciphertext |
+| `/csfle2/pci`  | base64 ciphertext | plaintext |
+| `/csfle2/both` | plaintext | plaintext |
+| `/csfle2/none` | base64 ciphertext | base64 ciphertext |
+
+Per-field decryption is independent — each tagged field carries its own DEK reference. With `onFailure: ERROR,NONE` on the read path, an SR DEK Registry 403 (the SA has no role binding for that KEK) leaves the ciphertext in place rather than hard-failing the record. Net effect: each consumer page sees exactly what its principal is entitled to.
 
 ## Documentation
 
@@ -113,9 +147,9 @@ Rules live in the schema, so any rule edit is a SR `POST /subjects/.../versions`
 config/aws-session.env   # AWS creds, gitignored, mode 600
 config/*.properties      # 6 templates (envsubst'd at runtime by Makefile)
 schemas/mortgage_application.json
-data/mortgage-records.json
 scripts/00..03_*.sh
 web/server.py            # single-port wizard + 2 producer pages + 4 consumer pages
+web/datagen.py           # schema-driven sample-record generator (no static data file)
 Makefile
 startup.sh
 ARCHITECTURE.md
@@ -125,8 +159,10 @@ TROUBLESHOOTING.md
 ## Teardown
 
 ```bash
-make clean-rbac          # delete the 6 service accounts (cascades to per-SA API keys + role bindings)
-make clean-keys          # schedule both KMS keys for 7-day deletion + remove KMS aliases
+make clean-rbac          # delete the 6 CSFLE/CSPE service accounts (cascades to per-SA API keys + role bindings)
+make clean-keys          # schedule the 2 CSFLE/CSPE KMS keys for 7-day deletion + remove KMS aliases
+make clean-csfle2-rbac   # delete the 5 CSFLE2 SAs (only relevant if you ran the CSFLE2 add-on)
+make clean-csfle2-keys   # schedule the 2 CSFLE2 KMS keys for deletion (PII + PCI)
 # Manually delete topics / SR subjects / OrgAdmin API keys via Confluent Cloud UI or `confluent` CLI
 # After clean-rbac, clear the 30 *_SA_ID/*_API_KEY/*_API_SECRET lines from .env
 ```
