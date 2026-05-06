@@ -36,12 +36,12 @@ Then in the browser, walk the 4 cards top to bottom:
 1. **Card 1 — AWS credentials**: paste your `export AWS_*` block (the wizard parses key/secret/optional session token from any of: `export KEY=val`, `KEY="val"`, single/double/no quotes). Stored in `config/aws-session.env` (gitignored, mode 600).
 2. **Card 2 — Confluent Cloud sign-in**: shows your existing context if you're already logged in. Otherwise enter your CC email + password — the wizard runs `confluent login --save` in the background.
 3. **Card 3 — Pick env, cluster & topic names**: cascading dropdowns (envs first, clusters populate when env selected). Two text inputs default to `mortgage-csfle` / `mortgage-cspe`. Clicking "Save & mint API keys" describes the cluster + SR, mints fresh Kafka + SR API keys (and deletes orphaned old ones if you switch clusters), and writes everything to `.env`.
-4. **Card 4 — Setup** (5 buttons + "Run all"):
+4. **Card 4 — Setup** (5 buttons + "Run all"). Build infrastructure first, grant access last:
    - **1 · Stream Governance** — verifies SG is on `ADVANCED` (or upgrades via SRCM v3 PATCH; mints a Cloud-scoped API key on demand). **Billing implications: ADVANCED is a paid tier.**
    - **2 · KEKs** — `aws kms create-key` × 2 + `POST /dek-registry/v1/keks` × 2
-   - **3 · RBAC** — mints 3 service accounts (`producer`, `consumer-with-kek`, `consumer-no-kek`), 6 API keys (Kafka + SR per SA), and role bindings: producer gets `DeveloperWrite` on Topic + Subject + Kek; consumer-with-kek gets `DeveloperRead` on those + Group; **consumer-no-kek gets `DeveloperRead` on Topic + Subject + Group ONLY — no Kek binding**, so its DEK Registry lookups return 403 (the Confluent-side enforcement of the no-KEK boundary). Must follow KEKs because bindings reference KEK names.
-   - **4 · schemas** — `POST /subjects/{topic}-value/versions` for both topics with their respective rule sets
-   - **5 · topics** — `confluent kafka topic create` × 2
+   - **3 · schemas** — `POST /subjects/{topic}-value/versions` for both topics with their respective rule sets
+   - **4 · topics** — `confluent kafka topic create` × 2
+   - **5 · RBAC (last)** — mints **6 service accounts** (one per (topic, role) pair), 12 API keys (Kafka + SR per SA), and role bindings against the now-existing resources. Each producer SA gets `DeveloperWrite` on its Topic + Subject + Kek. Each consumer-with-KEK SA gets `DeveloperRead` on its Topic + Subject + Group + **its own KEK only** (CSFLE consumer can't see CSPE KEK and vice versa). Each consumer-no-KEK SA gets `DeveloperRead` on Topic + Subject + Group only — **no Kek binding**, so its DEK Registry lookups return 403 (the Confluent-side enforcement of the no-KEK boundary).
 
 After card 4 succeeds, use the nav to access:
 

@@ -848,14 +848,14 @@ def build_wizard_page() -> str:
 </div>
 
 <div class="card">
-  <div class="card-title">4. Setup (Stream Governance · KEKs · RBAC · schemas · topics)</div>
-  <div class="card-sub">Each step is idempotent. Step 1 verifies (or upgrades) Stream Governance to <span class="kbd">ADVANCED</span> (paid tier — encryption rules require it). Step 2 creates the 2 KEKs in AWS KMS + registers them in SR's DEK Registry. <strong>Step 3 mints 3 service accounts (producer, consumer-with-kek, consumer-no-kek) + 6 API keys + role bindings — the no-kek SA gets NO Kek binding so its DEK Registry lookups return 403.</strong> Steps 4-5 register the schemas with their rule sets and create the two Kafka topics. KEKs must precede RBAC because role bindings reference KEKs by name.</div>
+  <div class="card-title">4. Setup (Stream Governance · KEKs · schemas · topics · RBAC)</div>
+  <div class="card-sub">Each step is idempotent. Step 1 verifies (or upgrades) Stream Governance to <span class="kbd">ADVANCED</span> (paid tier — encryption rules require it). Steps 2-4 build the infrastructure: KEKs in AWS KMS + SR DEK Registry, schemas with their rule sets, then the Kafka topics. <strong>Step 5 (RBAC, last) mints 6 service accounts (one per page) + their API keys + role bindings against the now-existing topics, schemas, and KEKs — each consumer SA gets only the KEK access its page needs (CSFLE consumer can't see CSPE KEK and vice versa); the no-KEK SAs get NO Kek binding at all so SR returns 403 on DEK lookup.</strong></div>
   <div class="btn-row">
     <button class="btn btn-secondary" onclick="runSg()">1 · Stream Governance</button>
     <button class="btn btn-secondary" onclick="runStep(0)">2 · KEKs</button>
-    <button class="btn btn-secondary" onclick="runRbac()">3 · RBAC</button>
-    <button class="btn btn-secondary" onclick="runStep(1)">4 · schemas</button>
-    <button class="btn btn-secondary" onclick="runStep(2)">5 · topics</button>
+    <button class="btn btn-secondary" onclick="runStep(1)">3 · schemas</button>
+    <button class="btn btn-secondary" onclick="runStep(2)">4 · topics</button>
+    <button class="btn btn-secondary" onclick="runRbac()">5 · RBAC</button>
     <button class="btn" onclick="runAll()">Run all</button>
   </div>
   <div id="setup-log" class="log" style="display:none"></div>
@@ -1015,19 +1015,20 @@ function _runSse(url, label) {{
   }});
 }}
 function runSg()    {{ return _runSse('/bootstrap-sg',           'step 1 · Stream Governance'); }}
-function runRbac()  {{ return _runSse('/bootstrap-rbac',         'step 3 · RBAC'); }}
+function runRbac()  {{ return _runSse('/bootstrap-rbac',         'step 5 · RBAC'); }}
 function runStep(n) {{
-  // n=0 → KEKs (label 'step 2'); n=1 → schemas (label 'step 4'); n=2 → topics (label 'step 5')
-  const labels = ['2 · KEKs', '4 · schemas', '5 · topics'];
+  // n=0 → KEKs (step 2); n=1 → schemas (step 3); n=2 → topics (step 4)
+  const labels = ['2 · KEKs', '3 · schemas', '4 · topics'];
   return _runSse('/bootstrap-step?n=' + n, 'step ' + labels[n]);
 }}
 
 async function runAll() {{
-  let ok = await runSg();    if (!ok) {{ _stop(); return; }}    // step 1
-  ok = await runStep(0);     if (!ok) {{ _stop(); return; }}    // step 2 KEKs
-  ok = await runRbac();      if (!ok) {{ _stop(); return; }}    // step 3 RBAC (must follow KEKs)
-  ok = await runStep(1);     if (!ok) {{ _stop(); return; }}    // step 4 schemas
-  ok = await runStep(2);     if (!ok) {{ _stop(); return; }}    // step 5 topics
+  // Build infrastructure first, grant access last.
+  let ok = await runSg();    if (!ok) {{ _stop(); return; }}    // 1 SG
+  ok = await runStep(0);     if (!ok) {{ _stop(); return; }}    // 2 KEKs
+  ok = await runStep(1);     if (!ok) {{ _stop(); return; }}    // 3 schemas
+  ok = await runStep(2);     if (!ok) {{ _stop(); return; }}    // 4 topics
+  ok = await runRbac();      if (!ok) {{ _stop(); return; }}    // 5 RBAC (last — binds against existing resources)
 }}
 function _stop() {{ document.getElementById('setup-log').textContent += '— STOPPING —\\n'; }}
 
