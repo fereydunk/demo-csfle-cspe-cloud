@@ -262,7 +262,7 @@ The schema body (field set + `required` list) is identical to `mortgage_applicat
 |---|---|---|
 | `csfle2-producer`      | Topic + Subject + `Kek:pii` + `Kek:pci` | (writes) |
 | `csfle2-consumer-pii`  | Topic + Subject + Group + `Kek:pii` only | `ssn` only — PCI fields stay ciphertext |
-| `csfle2-consumer-pci`  | Topic + Subject + Group + `Kek:pci` only | `cc_*` only — `ssn` stays ciphertext |
+| `csfle2-consumer-pci`  | Topic + Subject + Group + `Kek:pci` only | `credit_card_number` + `card_cvv` only — `ssn` stays ciphertext |
 | `csfle2-consumer-both` | Topic + Subject + Group + both KEKs | all tagged fields |
 | `csfle2-consumer-none` | Topic + Subject + Group only | none — DEK Registry returns 403 for both KEKs |
 

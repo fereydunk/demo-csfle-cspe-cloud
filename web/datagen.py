@@ -140,6 +140,13 @@ def _by_type(prop: dict) -> object:
         return round(random.uniform(0, 1000), 2)
     if t == "boolean":
         return random.choice([True, False])
+    if t == "array":
+        # Empty array satisfies most schemas (`items` constraint not enforced
+        # if absent). If the schema requires elements, the user should add a
+        # name-heuristic for that field.
+        return []
+    if t == "object":
+        return {}
     return None
 
 
@@ -169,8 +176,8 @@ def main() -> None:
         sys.stderr.write("usage: datagen.py <csfle|cspe> <count>\n")
         sys.exit(2)
     topic_key, count_s = sys.argv[1], sys.argv[2]
-    if topic_key not in ("csfle", "cspe"):
-        sys.stderr.write(f"topic_key must be 'csfle' or 'cspe', got {topic_key!r}\n")
+    if topic_key not in ("csfle", "cspe", "csfle2"):
+        sys.stderr.write(f"topic_key must be 'csfle', 'cspe', or 'csfle2', got {topic_key!r}\n")
         sys.exit(2)
     env = {**_read_env_file(ENV_FILE), **os.environ}  # os.environ wins (Makefile path)
     for line in generate(env, topic_key, int(count_s)):

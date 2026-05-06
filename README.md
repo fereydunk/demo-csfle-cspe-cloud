@@ -120,13 +120,24 @@ make setup                    # all of the above
 # the 6 RBAC service accounts, and doesn't enforce per-KEK RBAC at the
 # Confluent layer. Use the wizard if you want the full RBAC story.
 
-make produce-csfle            # produce sample records to mortgage-csfle
-make produce-cspe             # produce sample records to mortgage-cspe
+make produce-csfle            # produce records to mortgage-csfle      (override count: COUNT=N)
+make produce-cspe             # produce records to mortgage-cspe       (override count: COUNT=N)
 
 make consume-csfle-auth       # AWS creds present → ssn decrypted
 make consume-csfle-unauth     # AWS creds STRIPPED → ssn ciphertext
 make consume-cspe-auth        # AWS creds present → full payload visible
 make consume-cspe-unauth      # AWS creds STRIPPED → opaque payload
+
+# CSFLE2 multi-rule add-on (separate from `make setup` since it needs
+# CSFLE2_TOPIC set in .env first — done via the wizard's card 3)
+make setup-csfle2             # 04_setup_csfle2.sh — KEKs + multi-rule schema + topic
+make produce-csfle2           # produce records to CSFLE2 topic        (override count: COUNT=N)
+make consume-csfle2-pii       # PII KEK only  → ssn plaintext, cc/cvv ciphertext
+make consume-csfle2-pci       # PCI KEK only  → cc/cvv plaintext, ssn ciphertext
+make consume-csfle2-both      # both KEKs     → all decrypted
+make consume-csfle2-none      # no KEKs       → all ciphertext
+make clean-csfle2-rbac        # delete the 5 CSFLE2 SAs
+make clean-csfle2-keys        # schedule the 2 CSFLE2 KMS keys for deletion
 
 make web                      # launch the wizard at :8893
 make kill                     # stop the wizard
@@ -145,10 +156,12 @@ Rules live in the schema, so any rule edit is a SR `POST /subjects/.../versions`
 ```
 .env                     # filled by wizard, gitignored
 config/aws-session.env   # AWS creds, gitignored, mode 600
-config/*.properties      # 6 templates (envsubst'd at runtime by Makefile)
-schemas/mortgage_application.json
-scripts/00..03_*.sh
-web/server.py            # single-port wizard + 2 producer pages + 4 consumer pages
+config/*.properties      # 11 templates (6 CSFLE/CSPE + 5 CSFLE2; envsubst'd at runtime by Makefile)
+schemas/mortgage_application.json          # CSFLE + CSPE (ssn=PII)
+schemas/mortgage_application_csfle2.json   # CSFLE2 (same fields, ssn=PII + cc/cvv=PCI)
+scripts/00..03_*.sh                        # CSFLE + CSPE setup
+scripts/04_setup_csfle2.sh                 # CSFLE2 setup (KEKs + validateRules + schema + topic)
+web/server.py            # single-port wizard + 3 producer pages + 8 consumer pages
 web/datagen.py           # schema-driven sample-record generator (no static data file)
 Makefile
 startup.sh
@@ -167,6 +180,6 @@ make clean-csfle2-keys   # schedule the 2 CSFLE2 KMS keys for deletion (PII + PC
 # After clean-rbac, clear the 30 *_SA_ID/*_API_KEY/*_API_SECRET lines from .env
 ```
 
-## Known assumption
+## Encryption executor
 
-The producer/consumer config uses ONE executor entry (`FieldEncryptionExecutor`) on the assumption that the rule executor framework dispatches by rule type internally — this works for both `ENCRYPT` (CSFLE) and `ENCRYPT_PAYLOAD` (CSPE) rules. If first-run shows "no executor for `ENCRYPT_PAYLOAD`", add a second executor entry for `PayloadEncryptionExecutor` (search for `TODO verify` in `config/producer-csfle.properties`).
+The producer/consumer config uses **one** `FieldEncryptionExecutor` entry. The rule executor framework dispatches by rule type internally, so the same single entry handles `ENCRYPT` (CSFLE field-level), `ENCRYPT_PAYLOAD` (CSPE payload), and multi-rule `ENCRYPT` (CSFLE2 PII + PCI). Verified end-to-end across all three flows.

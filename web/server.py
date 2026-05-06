@@ -33,7 +33,8 @@ from urllib.parse import parse_qs, urlparse
 
 import datagen
 
-PORT       = 8893
+PORT        = 8893
+MAX_RECORDS = 100        # producer-page UI clamp; mirrored on the server in /produce-stream
 REPO_DIR   = Path(__file__).resolve().parent.parent
 ENV_FILE   = REPO_DIR / ".env"
 AWS_FILE   = REPO_DIR / "config" / "aws-session.env"
@@ -65,6 +66,25 @@ CONSUMER_GROUPS = {
     ("csfle2", "consumer-pci"):  "demo-csfle2-pci-web",
     ("csfle2", "consumer-both"): "demo-csfle2-both-web",
     ("csfle2", "consumer-none"): "demo-csfle2-none-web",
+}
+
+# Maps SA role name → .env-key prefix. Single source of truth used by the two
+# RBAC bootstrap handlers (`_stream_rbac_setup` and `_stream_csfle2_setup`).
+# 11 roles total: 6 CSFLE/CSPE + 5 CSFLE2.
+SA_ROLE_TO_ENV_PREFIX = {
+    # CSFLE / CSPE — 6 SAs × 5 vars = 30 .env entries
+    "csfle-producer":           "CSFLE_PRODUCER",
+    "cspe-producer":            "CSPE_PRODUCER",
+    "csfle-consumer-with-kek":  "CSFLE_CONSUMER_KEK",
+    "csfle-consumer-no-kek":    "CSFLE_CONSUMER_NOKEK",
+    "cspe-consumer-with-kek":   "CSPE_CONSUMER_KEK",
+    "cspe-consumer-no-kek":     "CSPE_CONSUMER_NOKEK",
+    # CSFLE2 — 5 SAs × 5 vars = 25 .env entries
+    "csfle2-producer":          "CSFLE2_PRODUCER",
+    "csfle2-consumer-pii":      "CSFLE2_CONSUMER_PII",
+    "csfle2-consumer-pci":      "CSFLE2_CONSUMER_PCI",
+    "csfle2-consumer-both":     "CSFLE2_CONSUMER_BOTH",
+    "csfle2-consumer-none":     "CSFLE2_CONSUMER_NONE",
 }
 
 BOOTSTRAP_SCRIPTS = [
@@ -163,7 +183,7 @@ def _principal_keys(env: dict[str, str], topic_key: str, role: str) -> dict[str,
     keys haven't been minted yet — keeps the Makefile CLI flow working before
     the wizard's RBAC step has run, and keeps backward compat with pre-RBAC
     .env files."""
-    role_suffix = {
+    _ROLE_SUFFIX_TABLE = {
         "producer":          "PRODUCER",
         "consumer-with-kek": "CONSUMER_KEK",
         "consumer-no-kek":   "CONSUMER_NOKEK",
@@ -172,7 +192,15 @@ def _principal_keys(env: dict[str, str], topic_key: str, role: str) -> dict[str,
         "consumer-pci":      "CONSUMER_PCI",
         "consumer-both":     "CONSUMER_BOTH",
         "consumer-none":     "CONSUMER_NONE",
-    }.get(role)
+    }
+    role_suffix = _ROLE_SUFFIX_TABLE.get(role)
+    if role and role_suffix is None:
+        # Unknown role names silently falling back to OrgAdmin keys would be a
+        # surprising privilege escalation — surface it so typos are caught fast.
+        sys.stderr.write(
+            f"WARN: _principal_keys: unknown role {role!r} for topic_key {topic_key!r} — "
+            f"falling back to OrgAdmin keys. Known roles: {sorted(_ROLE_SUFFIX_TABLE)}\n"
+        )
     prefix = f"{topic_key.upper()}_{role_suffix}" if role_suffix else None
     if prefix and env.get(f"{prefix}_KAFKA_API_KEY") and env.get(f"{prefix}_SR_API_KEY"):
         return {
@@ -264,17 +292,23 @@ def _consumer_env(role: str) -> dict[str, str]:
     For CSFLE2 multi-rule pages: pii/pci/both consumers all get AWS creds
     (they need to call KMS for the KEKs they ARE allowed); the per-KEK
     enforcement happens at the SR DEK Registry layer (403 for KEKs the SA
-    isn't role-bound to). Only the 'none' consumer gets AWS creds stripped."""
+    isn't role-bound to). Only the 'none' consumer gets AWS creds stripped.
+
+    Always disable IMDS — the demo runs on a laptop (no IMDS reachable), but
+    if anyone runs this on EC2 the JVM AWS SDK could otherwise fall back to
+    the instance role and silently bypass the explicit-creds intent."""
     env = os.environ.copy()
     env["JAVA_HOME"] = JAVA_HOME
     for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE"):
         env.pop(k, None)
+    # Belt-and-suspenders for ALL roles (including KEK-having ones): we want
+    # the subprocess to use ONLY the creds we explicitly set, never IMDS.
+    env["AWS_EC2_METADATA_DISABLED"] = "true"
     if role in _AWS_CREDS_ROLES:
         env.update(_aws_creds())
     else:
         env["AWS_SHARED_CREDENTIALS_FILE"] = "/dev/null"
         env["AWS_CONFIG_FILE"]             = "/dev/null"
-        env["AWS_EC2_METADATA_DISABLED"]   = "true"
     return env
 
 
@@ -1106,7 +1140,7 @@ ccStatus();
 
 def build_producer_page(topic_key: str) -> str:
     env = _read_env_file(ENV_FILE)
-    sample_count = 20  # default batch size; UI clamp goes up to MAX_RECORDS
+    default_count = 20  # producer-page default batch size; UI + server clamp at MAX_RECORDS
     topic   = env.get(f"{topic_key.upper()}_TOPIC") or f"mortgage-{topic_key}"
     subject = f"{topic}-value"
     if topic_key == "csfle":
@@ -1162,7 +1196,7 @@ def build_producer_page(topic_key: str) -> str:
   <div class="card-title">Produce</div>
   <div class="card-sub">{explainer}</div>
   <label>How many records to send (generated fresh from the live schema)</label>
-  <input type="number" id="count" value="{sample_count}" min="1" max="100" style="max-width:8rem">
+  <input type="number" id="count" value="{default_count}" min="1" max="{MAX_RECORDS}" style="max-width:8rem">
   <div class="btn-row">
     <button class="btn" onclick="produce()">→ Produce to {safe_topic}</button>
     <span class="card-sub" style="margin:0">Then check: {consumers}</span>
@@ -1171,10 +1205,10 @@ def build_producer_page(topic_key: str) -> str:
 </div>
 
 <script>
-const MAX_RECORDS = 100;
+const MAX_RECORDS = {MAX_RECORDS};
 function produce() {{
-  // Clamp to the sample-file size so the UI label matches what the backend
-  // actually sends (backend silently caps at file length).
+  // Mirror server-side clamp in /produce-stream so the UI count matches what
+  // actually gets produced (no surprise truncation).
   let n = parseInt(document.getElementById('count').value, 10) || 1;
   if (n < 1)            n = 1;
   if (n > MAX_RECORDS)  n = MAX_RECORDS;
@@ -1252,9 +1286,14 @@ def _render_consumer_config(env: dict[str, str], topic_key: str, role: str) -> s
     # has its own per-(topic,role) SA — and the "with-KEK" consumers see only
     # the KEK for THEIR topic (csfle-with-kek doesn't see cspe-kek and vice
     # versa).
+    # Sentinel: empty sa_id ⇒ _principal_keys returned the OrgAdmin fallback
+    # (no per-SA keys minted yet). Use that to gate the OrgAdmin-fallback
+    # message — `principal` substring matching ("orgadmin" in principal) would
+    # be a fragile coupling to the fallback's principal label.
+    is_orgadmin_fallback = not sa_id
     if not sa_id:
         sa_id = "(OrgAdmin fallback)"
-    if "orgadmin" in principal:
+    if is_orgadmin_fallback:
         kek_state = '<span class="val empty">(OrgAdmin fallback — RBAC step not yet run)</span>'
     elif topic_key == "csfle2":
         # CSFLE2 has TWO KEKs (PII + PCI); each consumer page binds to a
@@ -1495,7 +1534,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/produce-stream":
             qs = parse_qs(parsed.query)
             topic_key = qs.get("topic", ["csfle"])[0]
-            count = int(qs.get("count", ["1"])[0])
+            # Server-side cap mirrors the UI's MAX_RECORDS=100. Without this a
+            # stray ?count=1000000 (browser tab refresh, typo) would have the
+            # producer slog through 1M synthetic records.
+            count = max(1, min(MAX_RECORDS, int(qs.get("count", ["1"])[0])))
             self._stream_producer(topic_key, count); return
 
         # Consumer pages
@@ -1692,19 +1734,21 @@ class Handler(BaseHTTPRequestHandler):
         return f"demo-csfle-cspe-cloud-{role}-{suffix}"
 
     def _stream_rbac_setup(self) -> None:
-        """Mint 3 service accounts (producer, consumer-with-kek, consumer-no-kek),
-        mint Kafka + SR API keys for each, and create role bindings such that:
+        """Mint 6 service accounts (one per (topic, role) pair across CSFLE
+        and CSPE) and create role bindings such that:
 
-          - producer SA  → DeveloperWrite on Topic + Subject + Kek (CSFLE & CSPE)
-          - consumer-with-kek SA → DeveloperRead on Topic + Subject + Group + Kek
-          - consumer-no-kek SA   → DeveloperRead on Topic + Subject + Group ONLY
-                                   (NO Kek binding — DEK Registry returns 403,
-                                   onFailure=NONE swallows it, page shows the
-                                   record-as-ciphertext contrast)
+          - {csfle,cspe}-producer        → DeveloperWrite on Topic + Subject + Kek
+          - {csfle,cspe}-consumer-with-kek → DeveloperRead  on Topic + Subject + Group + own KEK only
+          - {csfle,cspe}-consumer-no-kek   → DeveloperRead  on Topic + Subject + Group ONLY
+                                             (NO Kek binding — DEK Registry returns 403,
+                                             onFailure=NONE swallows it, page shows the
+                                             record-as-ciphertext contrast)
 
-        Persists 12 keys to .env: PRODUCER_{KAFKA,SR}_API_{KEY,SECRET},
-        CONSUMER_KEK_{KAFKA,SR}_API_{KEY,SECRET}, CONSUMER_NOKEK_{KAFKA,SR}_API_{KEY,SECRET}.
-        Skips any SA whose keys are already present in .env (idempotent on re-run)."""
+        Persists 30 entries to .env: 6 SAs × 5 vars each
+        ({CSFLE,CSPE}_{PRODUCER,CONSUMER_KEK,CONSUMER_NOKEK}_{SA_ID,KAFKA_API_KEY,
+        KAFKA_API_SECRET,SR_API_KEY,SR_API_SECRET}). Idempotent — skips any SA
+        whose keys are already present in .env. CSFLE2 SAs are minted by a
+        separate handler (`_stream_csfle2_setup`)."""
         self._start_sse()
         try:
             env = _read_env_file(ENV_FILE)
@@ -1769,15 +1813,7 @@ class Handler(BaseHTTPRequestHandler):
                     # NO Kek bindings.
                 ],
             }
-            # Maps role → .env-key prefix. 6 SAs × 5 vars each = 30 entries.
-            env_prefix = {
-                "csfle-producer":           "CSFLE_PRODUCER",
-                "cspe-producer":            "CSPE_PRODUCER",
-                "csfle-consumer-with-kek":  "CSFLE_CONSUMER_KEK",
-                "csfle-consumer-no-kek":    "CSFLE_CONSUMER_NOKEK",
-                "cspe-consumer-with-kek":   "CSPE_CONSUMER_KEK",
-                "cspe-consumer-no-kek":     "CSPE_CONSUMER_NOKEK",
-            }
+            env_prefix = SA_ROLE_TO_ENV_PREFIX  # shared with _stream_csfle2_setup
 
             updates: dict[str, str] = {}
             for role, bindings in specs.items():
@@ -1938,13 +1974,7 @@ class Handler(BaseHTTPRequestHandler):
                     # NO Kek bindings.
                 ],
             }
-            env_prefix = {
-                "csfle2-producer":       "CSFLE2_PRODUCER",
-                "csfle2-consumer-pii":   "CSFLE2_CONSUMER_PII",
-                "csfle2-consumer-pci":   "CSFLE2_CONSUMER_PCI",
-                "csfle2-consumer-both":  "CSFLE2_CONSUMER_BOTH",
-                "csfle2-consumer-none":  "CSFLE2_CONSUMER_NONE",
-            }
+            env_prefix = SA_ROLE_TO_ENV_PREFIX  # shared with _stream_rbac_setup
 
             updates: dict[str, str] = {}
             for role, bindings in specs.items():
@@ -2109,9 +2139,9 @@ class Handler(BaseHTTPRequestHandler):
 
             # Feed records one at a time; emit an SSE line per send showing
             # the FULL record JSON (no truncation — a typical mortgage record
-            # is ~300 chars and the log box wraps cleanly). A small sleep
-            # (50 ms) ensures the browser sees individual events instead of
-            # a single batch when the producer is fast.
+            # is ~300 chars and the log box wraps cleanly). EventSource flushes
+            # on every `\n\n` so no artificial pacing is needed for the browser
+            # to render events individually.
             for i, rec in enumerate(records, 1):
                 self._sse_data({"line": f"→ #{i:>3}/{len(records)}  {rec}"})
                 try:
@@ -2120,14 +2150,16 @@ class Handler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, OSError) as e:
                     self._sse_data({"line": f"✗ producer stdin closed mid-stream: {e}"})
                     break
-                time.sleep(0.05)
 
             try:
                 proc.stdin.close()
             except Exception:
                 pass
 
-            rc = proc.wait(timeout=60)
+            # 120s ceiling: a cold producer w/ CSFLE2 (2 KMS round-trips per
+            # record + 5s of feeding for count=100) can run 30-60s on the cold
+            # path. 60s used to be tight; 120s leaves headroom.
+            rc = proc.wait(timeout=120)
             t.join(timeout=2)
             self._sse_data({"line": f"▶ producer exited rc={rc}"})
             self._sse_data({"ok": rc == 0, "rc": rc}, event="done")
@@ -2239,13 +2271,21 @@ class Handler(BaseHTTPRequestHandler):
         self._start_sse()
         proc = None
         try:
-            # Authorized: stderr → stdout so config errors (KMS denied due to a
-            # real auth issue, schema 404, etc.) surface inline in red.
-            # Unauthorized: KMS-denied warnings are EXPECTED on every record
-            # (that's the whole point of the no-KEK page). Drop stderr to
-            # DEVNULL — the page should show only the records-as-ciphertext
-            # contrast, not a stream of "decrypt failed" noise.
-            stderr_target = subprocess.STDOUT if role == "authorized" else subprocess.DEVNULL
+            # Roles where stderr → stdout (config errors surface inline in red):
+            #   "authorized"      — full-KEK CSFLE/CSPE consumer
+            #   "consumer-pii"    — CSFLE2 partial-access (sees PII)
+            #   "consumer-pci"    — CSFLE2 partial-access (sees PCI)
+            #   "consumer-both"   — CSFLE2 full-KEK
+            # Roles where stderr → DEVNULL (KMS-denied warnings are EXPECTED on
+            # every record — silencing is the whole point of the no-KEK page):
+            #   "unauthorized"    — legacy CSFLE/CSPE no-KEK
+            #   "consumer-none"   — CSFLE2 no-KEK
+            # Trade-off: partial-access pages will surface real auth/schema
+            # errors but also emit per-record "denied" noise for the field they
+            # CAN'T decrypt. Acceptable — real errors are rare; "denied" is
+            # informative once and ignorable thereafter.
+            _STDERR_TO_STDOUT_ROLES = {"authorized", "consumer-pii", "consumer-pci", "consumer-both"}
+            stderr_target = subprocess.STDOUT if role in _STDERR_TO_STDOUT_ROLES else subprocess.DEVNULL
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,

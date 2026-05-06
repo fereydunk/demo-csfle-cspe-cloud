@@ -62,7 +62,7 @@ produce-csfle:
 	  --reader-property auto.register.schemas=false \
 	  --reader-property "rule.executors=_default_" \
 	  --reader-property "rule.executors._default_.class=$(EXECUTOR)" \
-	  < <(python3 web/datagen.py $(if $(findstring csfle,$@),csfle,cspe) $(or $(COUNT),20))
+	  < <(python3 web/datagen.py csfle $(or $(COUNT),20))
 
 produce-cspe:
 	@test -n "$(CSPE_TOPIC)" || (echo "ERROR: run 'make discover' first"; exit 1)
@@ -78,7 +78,7 @@ produce-cspe:
 	  --reader-property auto.register.schemas=false \
 	  --reader-property "rule.executors=_default_" \
 	  --reader-property "rule.executors._default_.class=$(EXECUTOR)" \
-	  < <(python3 web/datagen.py $(if $(findstring csfle,$@),csfle,cspe) $(or $(COUNT),20))
+	  < <(python3 web/datagen.py cspe $(or $(COUNT),20))
 
 # ── Consume ──────────────────────────────────────────────────────────────────
 # Authorized: AWS creds in env → KMS unwraps DEK → plaintext.

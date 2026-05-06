@@ -32,6 +32,11 @@ source "$ENV_FILE"
 [[ -n "${CSFLE2_TOPIC:-}"  ]] || { echo "ERROR: CSFLE2_TOPIC not set in .env (set via wizard card 3)" >&2; exit 1; }
 command -v aws >/dev/null     || { echo "ERROR: aws CLI not installed"  >&2; exit 1; }
 
+# Per-run scratch dir for curl response bodies (avoids predictable /tmp/*.json
+# names that would be race/symlink-attackable on shared hosts).
+TMPDIR_RUN=$(mktemp -d -t csfle2-setup.XXXXXX)
+trap 'rm -rf "$TMPDIR_RUN"' EXIT
+
 # Default the two KEK aliases if .env doesn't pin them
 : "${CSFLE2_PII_KEK_NAME:=mortgage-csfle2-pii-kek}"
 : "${CSFLE2_PCI_KEK_NAME:=mortgage-csfle2-pci-kek}"
@@ -75,7 +80,7 @@ register_kek_in_sr() {
   body=$(printf '{"name":"%s","kmsType":"aws-kms","kmsKeyId":"%s","shared":false,"doc":"%s"}' \
                 "$kek_name" "$kms_arn" "$doc")
   local status
-  status=$(curl -s -o /tmp/kek_response.json -w "%{http_code}" \
+  status=$(curl -s -o "$TMPDIR_RUN/kek_response.json" -w "%{http_code}" \
             -u "${SR_API_KEY}:${SR_API_SECRET}" \
             -H "Content-Type: application/json" \
             -X POST "${SR_URL}/dek-registry/v1/keks" \
@@ -84,7 +89,7 @@ register_kek_in_sr() {
     echo "  ✓ SR DEK registry: ${kek_name} (HTTP ${status})"
   else
     echo "  ✗ SR DEK registry: HTTP ${status}"
-    cat /tmp/kek_response.json
+    cat "$TMPDIR_RUN/kek_response.json"
     exit 1
   fi
 }
@@ -117,17 +122,41 @@ register_kek_in_sr "$CSFLE2_PCI_KEK_NAME" "$pci_arn" "CSFLE2 PCI KEK for ${CSFLE
 # it allows multi-rule but doesn't require or alter single-rule behavior.
 echo ""
 echo "── SR config: validateRules=false (global — unlocks multi-rule per schema) ──"
-status=$(curl -s -o /tmp/cfg_response.json -w "%{http_code}" \
+# GET-merge-PUT: SR /config PUT REPLACES the whole config (no field-level
+# merge). If an existing env has a non-default compatibilityLevel /
+# compatibilityGroup / defaultMetadata / defaultRuleSet, a naive PUT of just
+# {"validateRules": false} would silently reset those to defaults. So: read
+# the current config, merge our one new field in, write the union back.
+echo "→ GET ${SR_URL}/config (preserve existing compatibility / metadata)"
+get_status=$(curl -s -o "$TMPDIR_RUN/cfg_get.json" -w "%{http_code}" \
+              -u "${SR_API_KEY}:${SR_API_SECRET}" \
+              "${SR_URL}/config")
+if [[ "$get_status" == "200" ]]; then
+  merged=$(python3 -c "
+import json, sys
+cur = json.load(open('$TMPDIR_RUN/cfg_get.json'))
+cur['validateRules'] = False
+print(json.dumps(cur))
+")
+elif [[ "$get_status" == "404" ]]; then
+  # No global config set yet — start from just our flag
+  merged='{"validateRules": false}'
+else
+  echo "  ✗ GET /config: HTTP ${get_status} — cannot read current SR config"
+  cat "$TMPDIR_RUN/cfg_get.json"
+  exit 1
+fi
+status=$(curl -s -o "$TMPDIR_RUN/cfg_response.json" -w "%{http_code}" \
           -u "${SR_API_KEY}:${SR_API_SECRET}" \
           -H "Content-Type: application/json" \
           -X PUT "${SR_URL}/config" \
-          -d '{"validateRules": false}')
+          -d "$merged")
 if [[ "$status" == "200" ]]; then
   echo "  ✓ validateRules=false (HTTP 200) — multi-rule per schema unlocked SR-wide"
 else
   echo "  ✗ HTTP ${status} — multi-rule per schema may not be enabled on this CC org"
   echo "    (Limited Availability — contact your Confluent account team)"
-  cat /tmp/cfg_response.json
+  cat "$TMPDIR_RUN/cfg_response.json"
   exit 1
 fi
 
@@ -190,18 +219,18 @@ EOF
 register_schema() {
   local subject="$1" payload="$2"
   local status
-  status=$(curl -s -o /tmp/schema_response.json -w "%{http_code}" \
+  status=$(curl -s -o "$TMPDIR_RUN/schema_response.json" -w "%{http_code}" \
             -u "${SR_API_KEY}:${SR_API_SECRET}" \
             -H "Content-Type: application/vnd.schemaregistry.v1+json" \
             -X POST "${SR_URL}/subjects/${subject}/versions" \
             -d "$payload")
   if [[ "$status" == "200" ]]; then
     local sid
-    sid=$(python3 -c "import json; print(json.load(open('/tmp/schema_response.json'))['id'])")
+    sid=$(python3 -c "import json; print(json.load(open('"$TMPDIR_RUN/schema_response.json"'))['id'])")
     echo "  ✓ ${subject} → schema id ${sid}"
   else
     echo "  ✗ ${subject} → HTTP ${status}"
-    cat /tmp/schema_response.json
+    cat "$TMPDIR_RUN/schema_response.json"
     exit 1
   fi
 }
@@ -217,7 +246,7 @@ echo ""
 echo "── Create topic ${CSFLE2_TOPIC} ───────────────────────────────────────"
 if confluent kafka topic create "$CSFLE2_TOPIC" \
      --cluster "$CLUSTER_ID" --environment "$ENV_ID" \
-     --partitions 3 --if-not-exists 2>&1 | tee /tmp/topic_create.log; then
+     --partitions 3 --if-not-exists 2>&1 | tee "$TMPDIR_RUN/topic_create.log"; then
   echo "  ✓ ready"
 else
   echo "  ✗ topic create failed"
