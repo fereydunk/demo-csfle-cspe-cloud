@@ -1214,8 +1214,8 @@ def build_consumer_page(topic_key: str, role: str, title: str, accent: str) -> s
 </div>
 
 <div class="card">
-  <div class="card-title">Live consumer (Server-Sent Events)</div>
-  <div class="card-sub">JSON records arrive in green; subprocess errors (auth, schema, KMS) appear in red. Reload the page to spawn a fresh consumer with a new group id (re-reads from beginning).</div>
+  <div class="card-title">Records</div>
+  <div class="card-sub">Click <span class="kbd">Start (from beginning)</span> to spawn a consumer that reads every record on the topic. Reload the page to spawn another with a fresh group id.</div>
   <div class="btn-row">
     <button class="btn"               onclick="start(true)">Start (from beginning)</button>
     <button class="btn btn-secondary" onclick="start(false)">Resume (live tail)</button>
