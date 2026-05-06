@@ -1217,19 +1217,23 @@ def build_consumer_page(topic_key: str, role: str, title: str, accent: str) -> s
     nav_key = f"{topic_key}-{'auth' if role == 'authorized' else 'noauth'}"
     opaque_class = "true" if (topic_key == "cspe" and role == "unauthorized") else "false"
     slug = "with-kek" if role == "authorized" else "no-kek"
-    # CSPE no-KEK can't deserialize the encrypted payload as JSON, so the
-    # records list will stay empty even though the consumer DOES read the
-    # bytes from the topic. Surface that explicitly so the user doesn't
-    # think the page is broken.
+    # CSPE no-KEK shows the raw encrypted bytes wrapped in {"__raw__": "<b64>"} —
+    # matching how Confluent Cloud's UI displays un-decryptable CSPE payloads.
+    # Each record is opaque ciphertext (the demo's CSPE point: zero visibility
+    # without KEK access, vs CSFLE no-KEK where record structure is preserved
+    # and only the PII fields are ciphertext).
     cspe_nokek_note = (
-        '<div class="banner warn">This page intentionally shows nothing — '
-        'CSPE encrypts the <em>entire payload</em>, so the JSON deserializer '
-        'has no schema-shaped bytes to parse without KEK access. The encrypted '
-        "bytes ARE on the topic — verify with <span class=\"kbd\">kafka-console-consumer</span> "
-        '(plain, not json-schema) or by switching to the <a href="/cspe/with-kek" '
-        'style="color:#79c0ff">with-KEK page</a>. This is the demo\'s CSPE point: '
-        'no-KEK consumers see <strong>nothing</strong>, vs CSFLE no-KEK where they '
-        'see record structure with PII redacted.</div>'
+        '<div class="banner warn">CSPE encrypts the <em>entire payload</em>. '
+        'Without KEK access the JSON deserializer can\'t reconstruct the record, '
+        'so this page consumes the topic via the plain Kafka client (not the '
+        "JSON-schema console consumer) and shows the raw encrypted bytes wrapped in "
+        "<span class=\"kbd\">{&quot;__raw__&quot;: &quot;&lt;base64&gt;&quot;}</span> "
+        '— matching how Confluent Cloud\'s console UI displays un-decryptable CSPE '
+        'payloads. Compare this opaque blob to <a href="/cspe/with-kek" '
+        'style="color:#79c0ff">/cspe/with-kek</a> (full plaintext) or '
+        '<a href="/csfle/no-kek" style="color:#79c0ff">/csfle/no-kek</a> '
+        '(record structure visible, only PII fields ciphertext). That contrast is '
+        'the demo\'s point.</div>'
         if topic_key == "cspe" and role == "unauthorized" else ""
     )
     body = f"""
@@ -1882,7 +1886,96 @@ class Handler(BaseHTTPRequestHandler):
             if proc and proc.poll() is None:
                 proc.kill()
 
+    def _stream_cspe_nokek_raw(self, from_beginning: bool) -> None:
+        """CSPE no-KEK consumes the encrypted payload directly via the
+        confluent-kafka Python client (instead of the JSON-schema console
+        consumer, which would silently fail to deserialize the encrypted
+        bytes). For each message, we strip the 5-byte Confluent wire-format
+        header (1 magic byte + 4-byte schema ID), base64-encode the rest,
+        and wrap in `{"__raw__": "<base64>"}` — matching how Confluent
+        Cloud's UI displays un-decryptable CSPE payloads.
+
+        This path doesn't touch AWS KMS at all (no DEK to unwrap; we're
+        showing the raw ciphertext for visibility, not trying to decrypt)."""
+        import base64
+        try:
+            from confluent_kafka import Consumer, KafkaException
+        except ImportError:
+            self._start_sse()
+            self._sse_data({"raw": '{"__error__": "confluent-kafka-python not installed; '
+                                   'pip3 install confluent-kafka"}'})
+            self._sse_data({"ok": False, "rc": -1}, event="done")
+            return
+
+        env = _read_env_file(ENV_FILE)
+        topic = env.get("CSPE_TOPIC", "")
+        keys = _principal_keys(env, "cspe", "consumer-no-kek")
+        if not (topic and keys["kafka_key"] and env.get("BOOTSTRAP_SERVERS")):
+            self._start_sse()
+            self._sse_data({"raw": '{"__error__": "config missing — finish setup first"}'})
+            self._sse_data({"ok": False, "rc": -1}, event="done")
+            return
+
+        group = (f"{CONSUMER_GROUPS[('cspe', 'unauthorized')]}-raw-{int(time.time())}"
+                 if from_beginning else f"{CONSUMER_GROUPS[('cspe', 'unauthorized')]}-raw")
+        cfg = {
+            "bootstrap.servers":  env["BOOTSTRAP_SERVERS"],
+            "security.protocol":  "SASL_SSL",
+            "sasl.mechanism":     "PLAIN",
+            "sasl.username":      keys["kafka_key"],
+            "sasl.password":      keys["kafka_secret"],
+            "group.id":           group,
+            "auto.offset.reset":  "earliest" if from_beginning else "latest",
+            "enable.auto.commit": True,
+        }
+        self._start_sse()
+        consumer = None
+        try:
+            consumer = Consumer(cfg)
+            consumer.subscribe([topic])
+            while True:
+                msg = consumer.poll(timeout=2.0)
+                if msg is None:
+                    if not self._sse_keepalive():
+                        break
+                    continue
+                if msg.error():
+                    # Log Kafka-side errors (auth, broker down, etc.) but keep
+                    # the loop going so transient issues don't kill the page.
+                    if not self._sse_keepalive():
+                        break
+                    continue
+                raw = msg.value() or b""
+                # Confluent wire format: byte 0 is magic (0x00), bytes 1-4 are
+                # the big-endian schema ID, bytes 5+ are the payload — which
+                # for our CSPE topic is the AES-GCM-encrypted serialized JSON.
+                if len(raw) >= 5 and raw[0] == 0:
+                    schema_id = int.from_bytes(raw[1:5], "big")
+                    cipher    = raw[5:]
+                else:
+                    schema_id = None
+                    cipher    = raw
+                envelope = {"__raw__": base64.b64encode(cipher).decode("ascii")}
+                if schema_id is not None:
+                    envelope["__schema_id__"] = schema_id
+                # Wrap as a JSON string so the page's existing "raw" renderer
+                # treats it like any other record.
+                if not self._sse_data({"raw": json.dumps(envelope, indent=2)}):
+                    break
+        except Exception as e:
+            self._sse_data({"raw": f'{{"__error__": {json.dumps(str(e))}}}'})
+        finally:
+            if consumer is not None:
+                try: consumer.close()
+                except Exception: pass
+
     def _stream_consumer(self, topic_key: str, role: str, from_beginning: bool) -> None:
+        # CSPE no-KEK gets a special path: show the raw encrypted bytes wrapped
+        # in `{"__raw__": "<base64>"}` instead of an empty page. The other
+        # three consumer pages (CSFLE auth, CSFLE no-kek, CSPE auth) use the
+        # JSON-schema console consumer as before.
+        if topic_key == "cspe" and role == "unauthorized":
+            return self._stream_cspe_nokek_raw(from_beginning)
         try:
             cmd = _build_consumer_cmd(topic_key, role, from_beginning)
         except KeyError as e:

@@ -15,6 +15,12 @@ command -v aws       >/dev/null || { echo "ERROR: aws CLI not installed (needed 
                                 || { echo "ERROR: Java 21 not at /opt/homebrew/opt/openjdk@21" >&2; exit 1; }
 confluent kafka cluster list >/dev/null 2>&1 \
                                 || { echo "ERROR: confluent CLI not logged in — run 'confluent login --save'" >&2; exit 1; }
+# confluent-kafka-python is needed by the CSPE no-KEK consumer page (which
+# bypasses the JSON-schema deserializer to read the raw encrypted bytes for
+# the {"__raw__": "<base64>"} envelope display). Other pages don't need it.
+python3 -c "import confluent_kafka" 2>/dev/null \
+                                || { echo "WARN: confluent-kafka-python not installed — /cspe/no-kek will show an error banner."; \
+                                     echo "      Install with: pip3 install confluent-kafka"; }
 echo "✓ preflight ok"
 
 # AWS creds: report what we have, but don't fail if missing — the wizard will
