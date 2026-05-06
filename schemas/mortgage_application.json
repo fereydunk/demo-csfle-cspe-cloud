@@ -1,0 +1,15 @@
+{
+  "type": "object",
+  "title": "MortgageApplication",
+  "properties": {
+    "loan_id":            { "type": "string" },
+    "applicant_name":     { "type": "string" },
+    "ssn":                { "type": "string", "confluent:tags": ["PII"] },
+    "annual_income_usd":  { "type": "number" },
+    "loan_amount_usd":    { "type": "number" },
+    "credit_score":       { "type": "integer" },
+    "property_address":   { "type": "string" },
+    "loan_purpose":       { "type": "string", "enum": ["PURCHASE", "REFINANCE", "CASH_OUT"] }
+  },
+  "required": ["loan_id", "applicant_name", "ssn", "annual_income_usd", "loan_amount_usd", "credit_score", "property_address", "loan_purpose"]
+}
